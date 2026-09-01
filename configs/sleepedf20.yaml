@@ -1,0 +1,9 @@
+defaults: sleepedf78.yaml
+
+dataset:
+  name: sleepedf20
+  raw_dir: /kaggle/input/sleep-edf-78            # SAME raw data as SleepEDF-78 on purpose
+  processed_dir: /kaggle/working/processed/sleepedf20
+  subject_filter: "0-19"                          # subject numbers 00-19 only
+  # Everything else (channels, stage_map, sampling rate) inherited from sleepedf78.yaml
+  # since it's literally the same recordings, just a subject subset.

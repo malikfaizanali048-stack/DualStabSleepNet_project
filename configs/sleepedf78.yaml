@@ -1,0 +1,20 @@
+defaults: base.yaml
+
+dataset:
+  name: sleepedf78
+  raw_dir: /kaggle/input/sleep-edf-78            # UPDATE to your actual Kaggle dataset mount path
+  processed_dir: /kaggle/working/processed/sleepedf78
+  subject_filter: all                             # all 78 subjects
+  sampling_rate_hz: 100
+  channels:
+    eeg: "EEG Fpz-Cz"      # verify exact channel label against your EDF headers
+    eog: "EOG horizontal"
+    emg: "EMG submental"
+  stage_map:               # raw annotation label -> class index
+    "Sleep stage W": 0
+    "Sleep stage 1": 1
+    "Sleep stage 2": 2
+    "Sleep stage 3": 3
+    "Sleep stage 4": 3      # N3/N4 merged to N3 per paper's 5-class scheme (W,N1,N2,N3,REM)
+    "Sleep stage R": 4
+    # "Sleep stage ?" and "Movement time" excluded during preprocessing

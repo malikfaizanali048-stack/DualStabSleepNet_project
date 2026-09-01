@@ -1,0 +1,7 @@
+mne>=1.5
+numpy
+scipy
+pyyaml
+torch
+scikit-learn
+tqdm

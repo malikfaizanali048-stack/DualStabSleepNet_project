@@ -1,0 +1,47 @@
+# Shared hyperparameters from Table II of the DSSNet paper.
+# Dataset-specific configs (sleepedf20.yaml, sleepedf78.yaml, isruc_s3.yaml)
+# inherit this and override paths / channel names / N_data steps only.
+
+diffusion:
+  data_domain:
+    sigma_min: 0.05
+    sigma_max: 0.2
+    sigma_data: 0.5          # paper's sigma_data (EDM data statistic), NOT the
+                              # same as sigma_min/max noise range above
+    n_steps: 12               # paper reports 8 / 12 / 16 — 12 as default, sweep later
+  feature_domain:
+    sigma_feat_max: 0.2
+    num_levels: 4              # K
+    lambda_feat: 0.2
+    ema_momentum: 0.999        # mu
+
+model:
+  vit_dim: 256
+  vit_depth: 4
+  vit_heads: 4
+  num_channels: 3             # EEG, EOG, EMG
+
+optim:
+  name: adamw
+  lr: 1.0e-4
+  weight_decay: 0.01          # not specified in paper; standard AdamW default, log this as an assumption
+  # NOT specified in paper -- documented assumptions, treat as first tuning knobs
+  batch_size: 128
+  stage1_epochs: 30           # feature-diffusion-only warmup stage
+  stage2_epochs: 100          # joint fine-tune stage
+  early_stopping_patience: 15
+  lr_schedule: cosine
+
+data:
+  epoch_seconds: 30
+  stft:
+    # NOT specified in paper -- documented assumption, first tuning knob if
+    # reproduction gap appears. Common choice in sleep-staging literature.
+    win_seconds: 2
+    hop_seconds: 1
+    window: hann
+
+eval:
+  checkpoint_selection: best_val_macro_f1   # paper likely reports best-val, not last-epoch
+  split_strategy: subject_wise_kfold        # never split at epoch level -- leakage risk
+  n_folds: 10
