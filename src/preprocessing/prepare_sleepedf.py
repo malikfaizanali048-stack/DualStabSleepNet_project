@@ -31,7 +31,9 @@ import re
 import sys
 
 import numpy as np
-import yaml
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from src.config_utils import load_config, deep_merge  # noqa: F401
 
 try:
     import mne
@@ -54,25 +56,7 @@ EPOCH_SEC = 30
 PAD_MINUTES = 30
 
 
-def load_config(path: str) -> dict:
-    """Loads a YAML config, merging in a `defaults:` parent chain if present."""
-    with open(path, "r") as f:
-        cfg = yaml.safe_load(f)
-    if "defaults" in cfg:
-        parent_path = os.path.join(os.path.dirname(path), cfg.pop("defaults"))
-        parent_cfg = load_config(parent_path)
-        cfg = deep_merge(parent_cfg, cfg)
-    return cfg
-
-
-def deep_merge(base: dict, override: dict) -> dict:
-    out = dict(base)
-    for k, v in override.items():
-        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
-            out[k] = deep_merge(out[k], v)
-        else:
-            out[k] = v
-    return out
+from src.config_utils import load_config, deep_merge  # noqa: F401 (deep_merge kept for compat)
 
 
 def parse_subject_range(subject_filter: str):
@@ -85,16 +69,21 @@ def find_subject_pairs(raw_dir: str, subject_filter: str):
     """
     Finds matching PSG/Hypnogram EDF file pairs, e.g.:
       SC4001E0-PSG.edf  <->  SC4001EC-Hypnogram.edf
-    Returns list of (subject_id, psg_path, hyp_path), sorted, one pair per
-    subject (paper convention: use one recording per subject when duplicates
-    exist across nights -- adjust here if you want multi-night per subject).
+    Returns list of (recording_id, psg_path, hyp_path) -- one pair PER
+    RECORDING (i.e. per subject-night, e.g. SC4001E0 and SC4002E0 are the
+    SAME person's two different nights). Grouping recordings back into true
+    subjects (for leakage-safe splitting) happens in dataset.py, not here.
     """
     psg_files = sorted(glob.glob(os.path.join(raw_dir, "**", "*PSG.edf"), recursive=True))
     pairs = []
     for psg_path in psg_files:
         base = os.path.basename(psg_path)
-        # Filenames look like SC4ssNE0-PSG.edf: ss=2-digit subject, N=1-digit night.
-        m = re.match(r"SC4(\d{2})(\d)E", base)
+        # Filenames look like SC4ssNL0-PSG.edf: ss=2-digit subject, N=1-digit
+        # night, L=a letter that varies by recording equipment (E is most
+        # common, but some subjects -- e.g. 77-82 -- use G or other letters).
+        # Matching only "E" here was a real bug: it silently dropped every
+        # non-E recording with no warning.
+        m = re.match(r"SC4(\d{2})(\d)([A-Za-z])", base)
         if not m:
             continue
         subject_num = int(m.group(1))   # e.g. 0-19 for SleepEDF-20, 0-82ish for -78
@@ -105,8 +94,13 @@ def find_subject_pairs(raw_dir: str, subject_filter: str):
             if not (lo <= subject_num <= hi):
                 continue
 
+        # Match on the full night-specific prefix (subject+night), wildcarding
+        # only the trailing scorer-code letter (varies: C, J, etc). Matching on
+        # subject_num alone (bug, fixed here) would match BOTH nights'
+        # hypnograms and silently pair the wrong one via [0].
+        night_prefix = subject_full[:-1]  # e.g. "SC4001E0" -> "SC4001E"
         hyp_candidates = glob.glob(
-            os.path.join(os.path.dirname(psg_path), f"SC4{subject_num:02d}*Hypnogram.edf")
+            os.path.join(os.path.dirname(psg_path), f"{night_prefix}*Hypnogram.edf")
         )
         if not hyp_candidates:
             print(f"[WARN] No hypnogram found for {psg_path}, skipping.")
