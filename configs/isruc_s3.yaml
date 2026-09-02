@@ -1,0 +1,30 @@
+defaults: base.yaml
+
+dataset:
+  name: isruc_s3
+  raw_dir: /kaggle/input/datasets/malikfaizan029/isruc-sleep-group3   # UPDATE if your mount path differs
+  processed_dir: /kaggle/working/processed/isruc_s3
+  sampling_rate_hz: 200
+  hypnogram_scorer: 1   # ISRUC-S3 has 2 independent scorers ({n}_1.txt, {n}_2.txt);
+                         # paper doesn't specify which was used -- scorer 1 is the
+                         # convention in most published ISRUC preprocessing pipelines.
+                         # Switch to 2 to check sensitivity if results look off.
+  channels:
+    # Confirmed via literature cross-reference (Khalighi et al. 2016 + multiple
+    # downstream papers), NOT yet verified against a data dictionary bundled
+    # with this specific download -- if training accuracy looks anomalous,
+    # re-check these against ISRUC's official documentation.
+    eeg: "C3-A2"    # standard central EEG derivation, most common single-EEG choice in literature
+    eog: "ROC-A1"   # right EOG; LOC-A2 (left) would be the alternative -- undocumented in paper which
+    emg: "X1"        # confirmed: chin EMG (X2=ECG, X3/X4=leg EMG -- NOT used)
+  # ISRUC-S3 hypnogram label encoding (text files, one integer per 30s epoch):
+  # 0=W, 1=N1, 2=N2, 3=N3, 5=REM -- note "4" is skipped (legacy R&K->AASM
+  # stage-4 merge quirk). This is the standard convention across the ISRUC
+  # preprocessing literature; VERIFY against your actual unique-value dump
+  # before running at scale.
+  stage_map:
+    0: 0   # W
+    1: 1   # N1
+    2: 2   # N2
+    3: 3   # N3
+    5: 4   # REM
