@@ -3,20 +3,14 @@ Preprocess ISRUC-S3 (10 healthy subjects, single session each) into
 per-subject .npz epoch files, matching the same output format as
 prepare_sleepedf.py so downstream training code is dataset-agnostic.
 
-Format (confirmed against real files, not guessed):
+Format (confirmed against real files):
   {raw_dir}/{subject_num}/{subject_num}.rec        <- PSG signal, EDF format
                                                         despite .rec extension
   {raw_dir}/{subject_num}/{subject_num}_1.txt      <- hypnogram, scorer 1
   {raw_dir}/{subject_num}/{subject_num}_2.txt      <- hypnogram, scorer 2
-Each hypnogram line = one 30s epoch's label, aligned 1:1 with signal epochs
-(verified: 824 lines * 30s = 24720s = exact .rec duration for subject 3 --
-no off-by-one padding/trimming needed here, unlike SleepEDF's lights-off
-trimming).
+One hypnogram line = one 30s epoch label, 1:1 aligned with signal epochs.
 
-Unlike SleepEDF, there's no multi-night-per-person grouping to worry about
-here -- ISRUC-S3 is one recording per subject, so no person-level split
-logic is needed (dataset.py's generic subject_wise_split still works fine
-treating each numbered folder as its own subject).
+No person-level grouping needed (unlike SleepEDF) -- one recording per subject.
 
 Usage:
     python prepare_isruc.py --config ../../configs/isruc_s3.yaml
@@ -24,6 +18,7 @@ Usage:
 import argparse
 import os
 import sys
+import tempfile
 
 import numpy as np
 
@@ -36,10 +31,11 @@ except ImportError:
     sys.exit("mne is required. Install with: pip install mne --break-system-packages")
 
 EPOCH_SEC = 30
+PAD_MINUTES = 30  # lights-off trimming, same convention as prepare_sleepedf.py
+PAD_EPOCHS = int(PAD_MINUTES * 60 / EPOCH_SEC)
 
 
 def find_subject_dirs(raw_dir: str):
-    """ISRUC-S3 subjects are numbered folders (1-10 for the S3 subgroup)."""
     subjects = []
     for name in sorted(os.listdir(raw_dir), key=lambda x: (len(x), x)):
         subject_dir = os.path.join(raw_dir, name)
@@ -69,7 +65,17 @@ def read_hypnogram(subject_dir: str, subject_num: str, scorer: int, stage_map: d
 
 
 def extract_epochs(rec_path: str, labels: np.ndarray, channels: dict, sampling_rate_hz: int):
-    raw = mne.io.read_raw_edf(rec_path, preload=True, verbose=False)
+    # Bypass MNE's extension-based format sniffing by copying bytes to a
+    # temp file with a .edf suffix -- the .rec file IS EDF format internally,
+    # just named differently.
+    with open(rec_path, "rb") as f_in:
+        rec_bytes = f_in.read()
+
+    with tempfile.NamedTemporaryFile(suffix=".edf", delete=True) as tmp_file:
+        tmp_file.write(rec_bytes)
+        tmp_file.flush()
+        raw = mne.io.read_raw_edf(tmp_file.name, preload=True, verbose=False)
+
     if int(round(raw.info["sfreq"])) != sampling_rate_hz:
         raw.resample(sampling_rate_hz)
 
@@ -88,20 +94,29 @@ def extract_epochs(rec_path: str, labels: np.ndarray, channels: dict, sampling_r
     n_epochs = min(n_epochs_from_signal, len(labels))
     if n_epochs_from_signal != len(labels):
         print(f"  [WARN] Signal has {n_epochs_from_signal} epochs but hypnogram "
-              f"has {len(labels)} -- using min({n_epochs_from_signal}, {len(labels)}) = {n_epochs}")
+              f"has {len(labels)} -- using min = {n_epochs}")
 
     epochs_x = np.stack([
         data[:, i * samples_per_epoch:(i + 1) * samples_per_epoch]
         for i in range(n_epochs)
     ]).astype(np.float32)
     epochs_y = labels[:n_epochs]
+
+    # Lights-off trimming (see module docstring / PAD_MINUTES).
+    non_wake_idx = np.where(epochs_y != 0)[0]  # 0 = W in stage_map
+    if len(non_wake_idx) > 0:
+        lo = max(0, non_wake_idx[0] - PAD_EPOCHS)
+        hi = min(n_epochs, non_wake_idx[-1] + PAD_EPOCHS + 1)
+        epochs_x = epochs_x[lo:hi]
+        epochs_y = epochs_y[lo:hi]
+
     return epochs_x, epochs_y
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--limit", type=int, default=None, help="Debug: only process first N subjects")
+    parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
