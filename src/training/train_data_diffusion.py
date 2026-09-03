@@ -55,16 +55,21 @@ def main():
     print(f"Train epochs: {len(train_ds)}  Val epochs: {len(val_ds)}")
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                               num_workers=2, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2)
+                               num_workers=4, drop_last=True, pin_memory=True,
+                               persistent_workers=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                             num_workers=2, pin_memory=True, persistent_workers=True)
 
     net = DataDomainUNet1D(in_channels=cfg["model"]["num_channels"]).to(device)
     precond = EDMPrecond(sigma_data=dm_cfg["sigma_data"])
     opt = torch.optim.AdamW(net.parameters(), lr=cfg["optim"]["lr"],
                              weight_decay=cfg["optim"].get("weight_decay", 0.01))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
     best_val_loss = float("inf")
+    patience_counter = 0
+    patience = cfg["optim"].get("early_stopping_patience", 15)
     out_path = args.out or os.path.join(ds_cfg["processed_dir"], "..", "data_diffusion_best.pt")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
@@ -72,12 +77,15 @@ def main():
         net.train()
         train_losses = []
         for x, _ in train_loader:
-            x = x.to(device)
-            loss = edm_loss(net, x, dm_cfg["sigma_min"], dm_cfg["sigma_max"], precond)
-            opt.zero_grad()
-            loss.backward()
+            x = x.to(device, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", enabled=(device == "cuda")):
+                loss = edm_loss(net, x, dm_cfg["sigma_min"], dm_cfg["sigma_max"], precond)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             train_losses.append(loss.item())
         scheduler.step()
 
@@ -85,8 +93,9 @@ def main():
         val_losses = []
         with torch.no_grad():
             for x, _ in val_loader:
-                x = x.to(device)
-                loss = edm_loss(net, x, dm_cfg["sigma_min"], dm_cfg["sigma_max"], precond)
+                x = x.to(device, non_blocking=True)
+                with torch.autocast(device_type="cuda", enabled=(device == "cuda")):
+                    loss = edm_loss(net, x, dm_cfg["sigma_min"], dm_cfg["sigma_max"], precond)
                 val_losses.append(loss.item())
 
         train_loss = sum(train_losses) / len(train_losses)
@@ -95,12 +104,18 @@ def main():
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            patience_counter = 0
             torch.save({
                 "state_dict": net.state_dict(),
                 "norm_mean": mean, "norm_std": std,
                 "epoch": epoch, "val_loss": val_loss,
             }, out_path)
             print(f"  -> saved new best checkpoint to {out_path}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"  -> early stopping: no val_loss improvement for {patience} epochs")
+                break
 
     print(f"\nDone. Best val_loss={best_val_loss:.4f}. Checkpoint: {out_path}")
 

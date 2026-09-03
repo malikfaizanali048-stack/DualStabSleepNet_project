@@ -85,9 +85,12 @@ def main():
     batch_size = optim_cfg["batch_size"]
     train_sampler = make_balanced_sampler(train_ds)
     train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=train_sampler,
-                               num_workers=2, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=2)
+                               num_workers=4, drop_last=True, pin_memory=True,
+                               persistent_workers=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                             num_workers=2, pin_memory=True, persistent_workers=True)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                              num_workers=2, pin_memory=True, persistent_workers=True)
 
     # --- Model ---
     model = DSSNet(cfg).to(device)
@@ -105,6 +108,7 @@ def main():
     opt1 = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=optim_cfg["lr"]
     )
+    scaler1 = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
     for epoch in range(optim_cfg["stage1_epochs"]):
         model.train()
         # keep frozen submodules in eval() so e.g. dropout/BN in the
@@ -112,11 +116,13 @@ def main():
         model.vit_student.eval()
         losses = []
         for x, _ in train_loader:
-            x = x.to(device)
-            loss = model.forward_stage1(x)
-            opt1.zero_grad()
-            loss.backward()
-            opt1.step()
+            x = x.to(device, non_blocking=True)
+            opt1.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", enabled=(device == "cuda")):
+                loss = model.forward_stage1(x)
+            scaler1.scale(loss).backward()
+            scaler1.step(opt1)
+            scaler1.update()
             losses.append(loss.item())
         print(f"[Stage1] Epoch {epoch+1}/{optim_cfg['stage1_epochs']}  "
               f"loss={sum(losses)/len(losses):.4f}")
@@ -128,6 +134,7 @@ def main():
         [p for p in model.parameters() if p.requires_grad], lr=optim_cfg["lr"]
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=optim_cfg["stage2_epochs"])
+    scaler2 = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
     best_val_macro_f1 = -1.0
     patience_counter = 0
@@ -135,17 +142,20 @@ def main():
         model.train()
         losses = []
         for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
-            logits, feat_reg_loss = model.forward_stage2(x)
-            cls_loss = torch.nn.functional.cross_entropy(logits, y)
-            total_loss = cls_loss + fm_cfg["lambda_feat"] * feat_reg_loss
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            opt2.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", enabled=(device == "cuda")):
+                logits, feat_reg_loss = model.forward_stage2(x)
+                cls_loss = torch.nn.functional.cross_entropy(logits, y)
+                total_loss = cls_loss + fm_cfg["lambda_feat"] * feat_reg_loss
 
-            opt2.zero_grad()
-            total_loss.backward()
+            scaler2.scale(total_loss).backward()
+            scaler2.unscale_(opt2)
             torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad], max_norm=1.0
             )
-            opt2.step()
+            scaler2.step(opt2)
+            scaler2.update()
             model.ema_step()  # Eq 9, every step
             losses.append(total_loss.item())
         scheduler.step()
