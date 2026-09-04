@@ -55,6 +55,9 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--data_diffusion_ckpt", required=True)
     parser.add_argument("--out", default=None)
+    parser.add_argument("--resume", default=None,
+                         help="Path to a latest_checkpoint.pt from a previous "
+                              "(possibly interrupted) run of this script.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -101,6 +104,13 @@ def main():
     out_dir = args.out or os.path.join(ds_cfg["processed_dir"], "..")
     os.makedirs(out_dir, exist_ok=True)
     ckpt_path = os.path.join(out_dir, "dssnet_best.pt")
+    latest_path = os.path.join(out_dir, "latest_checkpoint.pt")
+
+    resume_state = None
+    if args.resume and os.path.exists(args.resume):
+        resume_state = torch.load(args.resume, map_location=device, weights_only=False)
+        print(f"Resuming from {args.resume}: stage={resume_state['stage']}, "
+              f"epoch={resume_state['epoch']}")
 
     # ============================ STAGE 1 ============================
     print("\n=== STAGE 1: training feature-diffusion modules only ===")
@@ -109,23 +119,52 @@ def main():
         [p for p in model.parameters() if p.requires_grad], lr=optim_cfg["lr"]
     )
     scaler1 = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
-    for epoch in range(optim_cfg["stage1_epochs"]):
-        model.train()
-        # keep frozen submodules in eval() so e.g. dropout/BN in the
-        # (frozen) student backbone doesn't add train-time noise
-        model.vit_student.eval()
-        losses = []
-        for x, _ in train_loader:
-            x = x.to(device, non_blocking=True)
-            opt1.zero_grad(set_to_none=True)
-            with torch.autocast(device_type="cuda", enabled=(device == "cuda")):
-                loss = model.forward_stage1(x)
-            scaler1.scale(loss).backward()
-            scaler1.step(opt1)
-            scaler1.update()
-            losses.append(loss.item())
-        print(f"[Stage1] Epoch {epoch+1}/{optim_cfg['stage1_epochs']}  "
-              f"loss={sum(losses)/len(losses):.4f}")
+
+    stage1_start_epoch = 0
+    if resume_state is not None and resume_state["stage"] == "stage1":
+        model.load_state_dict(resume_state["model_state_dict"])
+        opt1.load_state_dict(resume_state["opt_state_dict"])
+        scaler1.load_state_dict(resume_state["scaler_state_dict"])
+        stage1_start_epoch = resume_state["epoch"] + 1
+        print(f"  -> resuming Stage 1 at epoch {stage1_start_epoch}")
+    stage1_already_done = (
+        resume_state is not None
+        and resume_state["stage"] in ("stage1_done", "stage2")
+    )
+
+    if not stage1_already_done:
+        for epoch in range(stage1_start_epoch, optim_cfg["stage1_epochs"]):
+            model.train()
+            # keep frozen submodules in eval() so e.g. dropout/BN in the
+            # (frozen) student backbone doesn't add train-time noise
+            model.vit_student.eval()
+            losses = []
+            for x, _ in train_loader:
+                x = x.to(device, non_blocking=True)
+                opt1.zero_grad(set_to_none=True)
+                with torch.autocast(device_type="cuda", enabled=(device == "cuda")):
+                    loss = model.forward_stage1(x)
+                scaler1.scale(loss).backward()
+                scaler1.step(opt1)
+                scaler1.update()
+                losses.append(loss.item())
+            print(f"[Stage1] Epoch {epoch+1}/{optim_cfg['stage1_epochs']}  "
+                  f"loss={sum(losses)/len(losses):.4f}")
+
+            torch.save({
+                "stage": "stage1", "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "opt_state_dict": opt1.state_dict(),
+                "scaler_state_dict": scaler1.state_dict(),
+            }, latest_path)
+        # Mark Stage 1 fully complete (distinct from "in progress") so a
+        # resume that lands here later knows to skip straight to Stage 2.
+        torch.save({
+            "stage": "stage1_done", "epoch": optim_cfg["stage1_epochs"] - 1,
+            "model_state_dict": model.state_dict(),
+        }, latest_path)
+    else:
+        print("  -> Stage 1 already completed in a previous run, skipping.")
 
     # ============================ STAGE 2 ============================
     print("\n=== STAGE 2: joint fine-tuning ===")
@@ -138,7 +177,22 @@ def main():
 
     best_val_macro_f1 = -1.0
     patience_counter = 0
-    for epoch in range(optim_cfg["stage2_epochs"]):
+    stage2_start_epoch = 0
+    if resume_state is not None and resume_state["stage"] == "stage2":
+        model.load_state_dict(resume_state["model_state_dict"])
+        opt2.load_state_dict(resume_state["opt_state_dict"])
+        scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        scaler2.load_state_dict(resume_state["scaler_state_dict"])
+        best_val_macro_f1 = resume_state["best_val_macro_f1"]
+        patience_counter = resume_state["patience_counter"]
+        stage2_start_epoch = resume_state["epoch"] + 1
+        print(f"  -> resuming Stage 2 at epoch {stage2_start_epoch} "
+              f"(best_val_macro_f1 so far: {best_val_macro_f1*100:.2f}%)")
+    if resume_state is not None and resume_state["stage"] == "stage1_done":
+        model.load_state_dict(resume_state["model_state_dict"])
+        print("  -> loaded Stage 1 final weights, starting Stage 2 fresh")
+
+    for epoch in range(stage2_start_epoch, optim_cfg["stage2_epochs"]):
         model.train()
         losses = []
         for x, y in train_loader:
@@ -176,9 +230,22 @@ def main():
             print(f"  -> new best (val macro-F1={best_val_macro_f1*100:.2f}%), saved to {ckpt_path}")
         else:
             patience_counter += 1
-            if patience_counter >= optim_cfg["early_stopping_patience"]:
-                print(f"  -> early stopping (no improvement for {patience_counter} epochs)")
-                break
+
+        # Resumable checkpoint EVERY epoch, regardless of whether it was
+        # the best -- so an interruption never loses more than one epoch.
+        torch.save({
+            "stage": "stage2", "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "opt_state_dict": opt2.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler2.state_dict(),
+            "best_val_macro_f1": best_val_macro_f1,
+            "patience_counter": patience_counter,
+        }, latest_path)
+
+        if patience_counter >= optim_cfg["early_stopping_patience"]:
+            print(f"  -> early stopping (no improvement for {patience_counter} epochs)")
+            break
 
     # --- Final test-set evaluation using BEST checkpoint (not last epoch) ---
     print("\n=== Loading best checkpoint for final test evaluation ===")

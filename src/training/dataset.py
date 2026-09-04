@@ -110,7 +110,10 @@ class SleepEpochDataset(Dataset):
         self.y = np.concatenate(ys, axis=0)   # (N,)
 
     def set_normalization(self, mean: np.ndarray, std: np.ndarray):
-        """mean/std: shape (C,), computed from TRAIN split only."""
+        """mean/std: shape (C,). Applied ONCE, vectorized, to the whole
+        array here -- NOT per-sample in __getitem__ (that was the real
+        bottleneck: 138k+ individual numpy ops every single epoch)."""
+        self.x = (self.x.astype(np.float32) - mean[None, :, None]) / (std[None, :, None] + 1e-8)
         self.mean = mean
         self.std = std
 
@@ -118,10 +121,8 @@ class SleepEpochDataset(Dataset):
         return len(self.y)
 
     def __getitem__(self, idx):
-        x = self.x[idx].astype(np.float32)
-        if self.mean is not None:
-            x = (x - self.mean[:, None]) / (self.std[:, None] + 1e-8)
-        return torch.from_numpy(x), torch.tensor(int(self.y[idx]), dtype=torch.long)
+        # x is already normalized (see set_normalization) -- just slice.
+        return torch.from_numpy(self.x[idx]), torch.tensor(int(self.y[idx]), dtype=torch.long)
 
     def class_counts(self):
         return np.bincount(self.y, minlength=5)
