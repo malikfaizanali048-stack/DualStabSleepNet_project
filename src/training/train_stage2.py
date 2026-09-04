@@ -1,23 +1,18 @@
 """
-Stage 1 + Stage 2 training for the full DSSNet (Section III-C.c):
-  Stage 1: backbone frozen, train ONLY the K feature-domain diffusion
-           modules against the (static) EMA teacher (Eq 10-12).
-  Stage 2: unfreeze everything, joint objective L_total = L_cls + lambda*L_feat
-           (Eq 13), EMA teacher updated every step.
+Stage 2 ONLY (Section III-C.c): loads the Stage 1 checkpoint (feature
+diffusion modules pretrained against the frozen teacher), then unfreezes
+everything and jointly optimizes L_total = L_cls + lambda * L_feat (Eq 13),
+with the EMA teacher updated every step (Eq 9).
 
-PERFORMANCE FIX: this script now loads PRECOMPUTED, already-stabilized
-spectrograms (produced once by precompute_stabilized.py) instead of raw
-waveforms. This removes the frozen 12-step diffusion sampler from every
-training batch/epoch -- it already ran exactly once during precompute.
-Run precompute_stabilized.py BEFORE this script.
-
-Checkpoint selection: best validation macro-F1 (documented assumption --
-paper doesn't state its selection rule explicitly; best-val is standard
-practice and avoids reporting a lucky final-epoch number).
+Requires:
+  - precomputed spectrograms from precompute_stabilized.py
+  - a Stage 1 checkpoint from train_stage1.py
 
 Usage:
-    python train_dssnet_two_stage.py --config ../../configs/sleepedf78.yaml \
-        --cache_dir ../../cached_spectrograms
+    python train_stage2.py --config ../../configs/sleepedf78.yaml \
+        --cache_dir ../../cached_spectrograms \
+        --stage1_ckpt /kaggle/working/stage1_checkpoint.pt \
+        --out /kaggle/working/dssnet_best.pt
 """
 import argparse
 import os
@@ -52,9 +47,13 @@ def evaluate(model, loader, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--cache_dir", required=True,
-                         help="dir containing train/val/test_spectrograms.pt from precompute_stabilized.py")
-    parser.add_argument("--out", default=None)
+    parser.add_argument("--cache_dir", required=True)
+    parser.add_argument("--stage1_ckpt", required=True,
+                         help="checkpoint produced by train_stage1.py")
+    parser.add_argument("--out", default="/kaggle/working/dssnet_best.pt")
+    parser.add_argument("--resume", action="store_true",
+                         help="resume Stage 2 from --out if it already exists "
+                              "(instead of starting fresh from --stage1_ckpt)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -63,7 +62,6 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # --- Data: precomputed, already-stabilized spectrograms ---
     train_ds = CachedSpectrogramDataset(os.path.join(args.cache_dir, "train_spectrograms.pt"))
     val_ds = CachedSpectrogramDataset(os.path.join(args.cache_dir, "val_spectrograms.pt"))
     test_ds = CachedSpectrogramDataset(os.path.join(args.cache_dir, "test_spectrograms.pt"))
@@ -78,38 +76,26 @@ def main():
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
                               num_workers=0, pin_memory=True)
 
-    # --- Model (data_denoiser stays randomly-initialized and unused --
-    # stabilization already happened during precompute) ---
     model = DSSNet(cfg).to(device)
 
-    out_dir = args.out or "/kaggle/working"
-    os.makedirs(out_dir, exist_ok=True)
-    ckpt_path = os.path.join(out_dir, "dssnet_best.pt")
+    start_epoch = 0
+    best_val_macro_f1 = -1.0
 
-    # ============================ STAGE 1 ============================
-    print("\n=== STAGE 1: training feature-diffusion modules only ===")
-    model.set_stage1_trainable()
-    opt1 = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=optim_cfg["lr"]
-    )
-    scaler1 = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
-    for epoch in range(optim_cfg["stage1_epochs"]):
-        model.train()
-        model.vit_student.eval()
-        losses = []
-        for spec, _ in train_loader:
-            spec = spec.to(device, non_blocking=True)
-            opt1.zero_grad(set_to_none=True)
-            with torch.autocast(device_type="cuda", enabled=(device == "cuda")):
-                loss = model.forward_stage1_from_spec(spec)
-            scaler1.scale(loss).backward()
-            scaler1.step(opt1)
-            scaler1.update()
-            losses.append(loss.item())
-        print(f"[Stage1] Epoch {epoch+1}/{optim_cfg['stage1_epochs']}  "
-              f"loss={sum(losses)/len(losses):.4f}")
+    if args.resume and os.path.exists(args.out):
+        # Continuing an interrupted Stage 2 run.
+        ckpt = torch.load(args.out, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        best_val_macro_f1 = ckpt["val_metrics"]["macro_f1"]
+        print(f"Resumed Stage 2 from epoch {start_epoch} "
+              f"(best val macro-F1={best_val_macro_f1*100:.2f}%)")
+    else:
+        # Fresh Stage 2 start: load Stage 1's trained feature-diffusion weights.
+        stage1_ckpt = torch.load(args.stage1_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(stage1_ckpt["model_state_dict"])
+        print(f"Loaded Stage 1 checkpoint from {args.stage1_ckpt} "
+              f"(stage1 loss={stage1_ckpt.get('loss', 'n/a')})")
 
-    # ============================ STAGE 2 ============================
     print("\n=== STAGE 2: joint fine-tuning ===")
     model.set_stage2_trainable()
     opt2 = torch.optim.AdamW(
@@ -118,9 +104,9 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=optim_cfg["stage2_epochs"])
     scaler2 = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
-    best_val_macro_f1 = -1.0
     patience_counter = 0
-    for epoch in range(optim_cfg["stage2_epochs"]):
+    total_epochs = optim_cfg["stage2_epochs"]
+    for epoch in range(start_epoch, total_epochs):
         model.train()
         losses = []
         for spec, y in train_loader:
@@ -143,7 +129,7 @@ def main():
         scheduler.step()
 
         val_metrics = evaluate(model, val_loader, device)
-        print(f"[Stage2] Epoch {epoch+1}/{optim_cfg['stage2_epochs']}  "
+        print(f"[Stage2] Epoch {epoch+1}/{total_epochs}  "
               f"train_loss={sum(losses)/len(losses):.4f}  "
               f"val: {format_metrics(val_metrics)}")
 
@@ -154,17 +140,16 @@ def main():
                 "model_state_dict": model.state_dict(),
                 "val_metrics": val_metrics,
                 "epoch": epoch,
-            }, ckpt_path)
-            print(f"  -> new best (val macro-F1={best_val_macro_f1*100:.2f}%), saved to {ckpt_path}")
+            }, args.out)
+            print(f"  -> new best (val macro-F1={best_val_macro_f1*100:.2f}%), saved to {args.out}")
         else:
             patience_counter += 1
             if patience_counter >= optim_cfg["early_stopping_patience"]:
                 print(f"  -> early stopping (no improvement for {patience_counter} epochs)")
                 break
 
-    # --- Final test-set evaluation using BEST checkpoint (not last epoch) ---
     print("\n=== Loading best checkpoint for final test evaluation ===")
-    best = torch.load(ckpt_path, map_location=device, weights_only=False)
+    best = torch.load(args.out, map_location=device, weights_only=False)
     model.load_state_dict(best["model_state_dict"])
     test_metrics = evaluate(model, test_loader, device)
     print("\nFINAL TEST METRICS:")

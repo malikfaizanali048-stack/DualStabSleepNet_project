@@ -1,3 +1,4 @@
+
 """
 Stage 0: train the data-domain diffusion module INDEPENDENTLY of everything
 else (paper III-B: "trained independently and frozen after convergence...
@@ -34,6 +35,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--out", default=None, help="checkpoint output path")
+    parser.add_argument("--resume", action="store_true", help="resume from existing checkpoint")
+    parser.add_argument("--resume", action="store_true", help="resume from existing checkpoint")
+    parser.add_argument("--resume", action="store_true", help="resume from existing checkpoint")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -50,21 +54,49 @@ def main():
     train_ds = SleepEpochDataset(ds_cfg["processed_dir"], train_subj)
     val_ds = SleepEpochDataset(ds_cfg["processed_dir"], val_subj)
     mean, std = compute_normalization_stats(train_ds)
-    train_ds.set_normalization(mean, std)
+    train_ds.set_normalization(mean, std)  # now vectorized once, not per-sample
     val_ds.set_normalization(mean, std)
     print(f"Train epochs: {len(train_ds)}  Val epochs: {len(val_ds)}")
 
+    # FIX: num_workers=0 -- data is already fully in RAM, so multiprocessing
+    # workers only add overhead on Kaggle's shared/limited CPU. Also removed
+    # persistent_workers (invalid with num_workers=0).
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                               num_workers=4, drop_last=True, pin_memory=True,
-                               persistent_workers=True)
+                           num_workers=2, drop_last=True, pin_memory=True,
+                           persistent_workers=True, prefetch_factor=4)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                             num_workers=2, pin_memory=True, persistent_workers=True)
+                         num_workers=2, pin_memory=True,
+                         persistent_workers=True, prefetch_factor=4)
 
     net = DataDomainUNet1D(in_channels=cfg["model"]["num_channels"]).to(device)
     precond = EDMPrecond(sigma_data=dm_cfg["sigma_data"])
     opt = torch.optim.AdamW(net.parameters(), lr=cfg["optim"]["lr"],
                              weight_decay=cfg["optim"].get("weight_decay", 0.01))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+
+    start_epoch = 0
+    resume_path = args.out or "/kaggle/working/data_diffusion_best.pt"
+    if args.resume and os.path.exists(resume_path):
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        net.load_state_dict(ckpt["state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        print(f"Resumed from epoch {start_epoch} (val_loss={ckpt.get('val_loss','n/a')})")
+
+    start_epoch = 0
+    resume_path = args.out or "/kaggle/working/data_diffusion_best.pt"
+    if args.resume and os.path.exists(resume_path):
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        net.load_state_dict(ckpt["state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        print(f"Resumed from epoch {start_epoch} (val_loss={ckpt.get('val_loss','n/a')})")
+
+    start_epoch = 0
+    resume_path = args.out or "/kaggle/working/data_diffusion_best.pt"
+    if args.resume and os.path.exists(resume_path):
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        net.load_state_dict(ckpt["state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        print(f"Resumed from epoch {start_epoch} (val_loss={ckpt.get('val_loss','n/a')})")
     scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
     best_val_loss = float("inf")
@@ -73,7 +105,7 @@ def main():
     out_path = args.out or os.path.join(ds_cfg["processed_dir"], "..", "data_diffusion_best.pt")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         net.train()
         train_losses = []
         for x, _ in train_loader:

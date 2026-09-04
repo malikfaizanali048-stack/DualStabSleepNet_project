@@ -3,7 +3,7 @@ defaults: base.yaml
 dataset:
   name: sleepedf78
   raw_dir: /kaggle/input/sleep-edf-78            # UPDATE to your actual Kaggle dataset mount path
-  processed_dir: /kaggle/working/processed/sleepedf78
+  processed_dir: /kaggle/input/datasets/malikfaizan029/dssnet-processed-sleepedf-78
   subject_filter: all                             # all 78 subjects
   sampling_rate_hz: 100
   channels:

@@ -13,6 +13,19 @@ classifier visibility into all hierarchy levels, then two linear layers
 down to num_classes=5. This is a documented assumption -- if per-class
 numbers (esp. N1, the hardest stage) don't match Table IV, this fusion
 head is one of the first places to revisit.
+
+PERFORMANCE NOTE: forward_stage1 / forward_stage2 / forward_infer run the
+frozen data-domain diffusion module's 12-step Heun sampler every call.
+Since that module is frozen (never updated during Stage 1/2), its output
+for a given input never changes -- re-running it every batch of every
+epoch is wasteful. src/training/precompute_stabilized.py runs it ONCE per
+sample ahead of time and caches the resulting spectrogram; the
+`_from_spec` variants below (forward_stage1_from_spec,
+forward_stage2_from_spec, forward_infer_from_spec) consume those cached
+spectrograms directly, skipping stabilize_waveform + to_spectrogram
+entirely. Use these in train_dssnet_two_stage.py once cached data exists.
+The original x_raw-based methods are kept unchanged for cases where cached
+spectrograms aren't available.
 """
 import torch
 import torch.nn as nn
@@ -110,6 +123,10 @@ class DSSNet(nn.Module):
         Stage 1 (backbone frozen): train ONLY feature diffusion modules on
         Eq 10-12 against the (static, since backbone frozen) teacher.
         Returns the scalar loss sum_k L_feat^(k).
+
+        NOTE: runs the frozen 12-step diffusion sampler every call. Prefer
+        forward_stage1_from_spec() with precomputed spectrograms for
+        training loops (see precompute_stabilized.py).
         """
         with torch.no_grad():
             x_stable = self.stabilize_waveform(x_raw)
@@ -124,10 +141,31 @@ class DSSNet(nn.Module):
             )
         return total_loss
 
+    def forward_stage1_from_spec(self, spec: torch.Tensor):
+        """
+        Same as forward_stage1, but takes an already-stabilized,
+        already-STFT'd spectrogram (from precompute_stabilized.py) instead
+        of raw waveform -- skips the frozen diffusion sampler entirely.
+        """
+        with torch.no_grad():
+            teacher_features = self.vit_teacher(spec)
+
+        total_loss = 0.0
+        for k in range(self.num_levels):
+            total_loss = total_loss + feature_diffusion_loss(
+                self.feat_modules[k], self.feat_precond, teacher_features[k],
+                self.feat_sigma_min, self.feat_sigma_max,
+            )
+        return total_loss
+
     def forward_stage2(self, x_raw: torch.Tensor):
         """
         Stage 2 (joint fine-tune): returns (logits, feat_reg_loss).
         Caller combines: L_total = CE(logits, y) + lambda * feat_reg_loss  (Eq 13)
+
+        NOTE: runs the frozen 12-step diffusion sampler every call. Prefer
+        forward_stage2_from_spec() with precomputed spectrograms for
+        training loops (see precompute_stabilized.py).
         """
         with torch.no_grad():
             x_stable = self.stabilize_waveform(x_raw)
@@ -152,11 +190,46 @@ class DSSNet(nn.Module):
         logits = self.classifier(stabilized_features)
         return logits, feat_reg_loss
 
+    def forward_stage2_from_spec(self, spec: torch.Tensor):
+        """
+        Same as forward_stage2, but takes an already-stabilized,
+        already-STFT'd spectrogram instead of raw waveform -- skips the
+        frozen diffusion sampler entirely.
+        """
+        student_features = self.vit_student(spec)
+        with torch.no_grad():
+            teacher_features = self.vit_teacher(spec)
+
+        stabilized_features = []
+        feat_reg_loss = 0.0
+        for k in range(self.num_levels):
+            stabilized = project_features_train(
+                self.feat_modules[k], self.feat_precond, student_features[k],
+            )
+            stabilized_features.append(stabilized)
+            feat_reg_loss = feat_reg_loss + feature_diffusion_loss(
+                self.feat_modules[k], self.feat_precond, teacher_features[k],
+                self.feat_sigma_min, self.feat_sigma_max,
+            )
+
+        logits = self.classifier(stabilized_features)
+        return logits, feat_reg_loss
+
     @torch.no_grad()
     def forward_infer(self, x_raw: torch.Tensor) -> torch.Tensor:
         """Inference: student backbone + deterministic feature projection, no teacher needed."""
         x_stable = self.stabilize_waveform(x_raw)
         spec = self.to_spectrogram(x_stable)
+        student_features = self.vit_student(spec)
+        stabilized_features = [
+            project_features(self.feat_modules[k], self.feat_precond, student_features[k])
+            for k in range(self.num_levels)
+        ]
+        return self.classifier(stabilized_features)
+
+    @torch.no_grad()
+    def forward_infer_from_spec(self, spec: torch.Tensor) -> torch.Tensor:
+        """Same as forward_infer, but takes a precomputed spectrogram directly."""
         student_features = self.vit_student(spec)
         stabilized_features = [
             project_features(self.feat_modules[k], self.feat_precond, student_features[k])

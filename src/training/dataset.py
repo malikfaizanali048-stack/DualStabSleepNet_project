@@ -9,6 +9,9 @@ Handles:
   - Class-balanced sampling for N1 (paper's biggest reported per-stage
     gain, e.g. +12.5% on SHHS -- naive random sampling under-represents
     it every batch since it's 3-14% of epochs, see Table I).
+  - CachedSpectrogramDataset: loads precomputed data-domain-stabilized +
+    STFT spectrograms produced by precompute_stabilized.py, so Stage 1/2
+    training never has to run the frozen 12-step diffusion sampler.
 
 ASSUMPTIONS (paper's exact split protocol not given in provided pages):
   - `subject_wise_kfold` with n_folds=10 as a reasonable default matching
@@ -100,44 +103,85 @@ class SleepEpochDataset(Dataset):
         self.subject_ids = subject_ids
         self.mean = None
         self.std = None
+        self._normalized = False
 
         xs, ys = [], []
         for sid in subject_ids:
             data = np.load(os.path.join(processed_dir, f"{sid}.npz"))
             xs.append(data["x"])
             ys.append(data["y"])
-        self.x = np.concatenate(xs, axis=0)   # (N, C, T)
+        self.x = np.concatenate(xs, axis=0).astype(np.float32)
         self.y = np.concatenate(ys, axis=0)   # (N,)
 
     def set_normalization(self, mean: np.ndarray, std: np.ndarray):
-        """mean/std: shape (C,). Applied ONCE, vectorized, to the whole
-        array here -- NOT per-sample in __getitem__ (that was the real
-        bottleneck: 138k+ individual numpy ops every single epoch)."""
-        self.x = (self.x.astype(np.float32) - mean[None, :, None]) / (std[None, :, None] + 1e-8)
-        self.mean = mean
-        self.std = std
+        """
+        mean/std: shape (C,), computed from TRAIN split only.
+
+        Normalizes the ENTIRE array once, vectorized -- not per __getitem__
+        call, which was the original CPU bottleneck.
+        """
+        self.mean = mean.astype(np.float32)
+        self.std = std.astype(np.float32)
+        self.x = (self.x - self.mean[None, :, None]) / (self.std[None, :, None] + 1e-8)
+        self._normalized = True
 
     def __len__(self):
         return len(self.y)
 
     def __getitem__(self, idx):
-        # x is already normalized (see set_normalization) -- just slice.
-        return torch.from_numpy(self.x[idx]), torch.tensor(int(self.y[idx]), dtype=torch.long)
+        x = self.x[idx]
+        return torch.from_numpy(x), torch.tensor(int(self.y[idx]), dtype=torch.long)
+
+    def class_counts(self):
+        return np.bincount(self.y, minlength=5)
+
+
+class CachedSpectrogramDataset(Dataset):
+    """
+    Loads precomputed (data-domain-stabilized + STFT) spectrograms produced
+    by src/training/precompute_stabilized.py. Used by Stage 1/2 training so
+    the frozen 12-step diffusion sampler never has to run during those
+    training loops -- it already ran exactly once, offline, during
+    precompute.
+
+    Exposes the same `.y` / `class_counts()` interface as SleepEpochDataset
+    so make_balanced_sampler() works unmodified.
+    """
+    def __init__(self, cache_path: str):
+        data = torch.load(cache_path, map_location="cpu", weights_only=False)
+        self.spec = data["spec"]        # (N, C, H, W) precomputed spectrograms
+        self.labels = data["labels"]    # (N,) long tensor
+        self.y = self.labels.numpy()    # numpy view for make_balanced_sampler compatibility
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return self.spec[idx], self.labels[idx]
 
     def class_counts(self):
         return np.bincount(self.y, minlength=5)
 
 
 def compute_normalization_stats(train_ds: SleepEpochDataset):
-    """Per-channel mean/std over ALL train-split epochs only."""
+    """Per-channel mean/std over ALL train-split epochs only.
+
+    NOTE: must be called BEFORE set_normalization() on train_ds, since
+    set_normalization now overwrites train_ds.x in place with the
+    normalized version.
+    """
     x = train_ds.x.astype(np.float64)
     mean = x.mean(axis=(0, 2))
     std = x.std(axis=(0, 2))
     return mean.astype(np.float32), std.astype(np.float32)
 
 
-def make_balanced_sampler(dataset: SleepEpochDataset) -> WeightedRandomSampler:
-    """Inverse-class-frequency sampling weights to counter N1 under-representation."""
+def make_balanced_sampler(dataset) -> WeightedRandomSampler:
+    """Inverse-class-frequency sampling weights to counter N1 under-representation.
+
+    Works with both SleepEpochDataset and CachedSpectrogramDataset -- both
+    expose .y (numpy labels) and .class_counts().
+    """
     counts = dataset.class_counts()
     class_weights = 1.0 / np.maximum(counts, 1)
     sample_weights = class_weights[dataset.y]
