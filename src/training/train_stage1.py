@@ -3,6 +3,11 @@ Stage 1 ONLY (Section III-C.c): backbone frozen, train ONLY the K
 feature-domain diffusion modules against the (static) EMA teacher
 (Eq 10-12).
 
+REQUIRES a backbone checkpoint from pretrain_backbone.py -- without it,
+the teacher is still random, untrained noise, and Stage 1 anchors
+feature-diffusion training to nothing meaningful (this was the root
+cause of very low downstream accuracy in an earlier run).
+
 Split out from the combined two-stage script so Stage 1 can be run,
 checkpointed, and the session closed -- Stage 2 picks up later from the
 saved checkpoint via train_stage2.py.
@@ -12,6 +17,7 @@ Requires precomputed spectrograms from precompute_stabilized.py.
 Usage:
     python train_stage1.py --config ../../configs/sleepedf78.yaml \
         --cache_dir ../../cached_spectrograms \
+        --backbone_ckpt /kaggle/working/backbone_pretrained.pt \
         --out /kaggle/working/stage1_checkpoint.pt
 """
 import argparse
@@ -31,6 +37,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--cache_dir", required=True)
+    parser.add_argument("--backbone_ckpt", default=None,
+                         help="checkpoint from pretrain_backbone.py -- REQUIRED for a "
+                              "fresh Stage 1 run (not needed when --resume is used)")
     parser.add_argument("--out", default="/kaggle/working/stage1_checkpoint.pt")
     parser.add_argument("--resume", action="store_true",
                          help="resume Stage 1 from --out if it already exists")
@@ -57,6 +66,17 @@ def main():
         model.load_state_dict(ckpt["model_state_dict"])
         start_epoch = ckpt["epoch"] + 1
         print(f"Resumed Stage 1 from epoch {start_epoch} (loss={ckpt.get('loss', 'n/a')})")
+    elif args.backbone_ckpt:
+        backbone_ckpt = torch.load(args.backbone_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(backbone_ckpt["model_state_dict"])
+        model.sync_teacher_to_student()  # CRITICAL: teacher must mirror the
+                                          # pretrained backbone, not random init
+        print(f"Loaded pretrained backbone from {args.backbone_ckpt} "
+              f"(val macro-F1={backbone_ckpt['val_metrics']['macro_f1']*100:.2f}%)")
+    else:
+        print("WARNING: no --backbone_ckpt given. Stage 1 will anchor feature-diffusion "
+              "training to a RANDOM, untrained teacher -- this is almost certainly why "
+              "accuracy was low before. Strongly recommended: run pretrain_backbone.py first.")
 
     print("\n=== STAGE 1: training feature-diffusion modules only ===")
     model.set_stage1_trainable()
@@ -83,8 +103,6 @@ def main():
         avg_loss = sum(losses) / len(losses)
         print(f"[Stage1] Epoch {epoch+1}/{total_epochs}  loss={avg_loss:.4f}")
 
-        # Save after EVERY epoch so an interruption never loses more than
-        # one epoch's progress, and --resume always has something to load.
         torch.save({
             "model_state_dict": model.state_dict(),
             "epoch": epoch,
